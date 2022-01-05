@@ -5,6 +5,7 @@ const log = require('../../util/log');
 const fetchWithTimeout = require('../../util/fetch-with-timeout');
 const languageNames = require('scratch-translate-extension-languages');
 const formatMessage = require('format-message');
+const CryptoJS = require('crypto-js');
 
 /**
  * Icon svg to be displayed in the blocks category menu, encoded as a data URI.
@@ -24,7 +25,12 @@ const blockIconURI = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAFAAAABQCAYA
  * The url of the translate server.
  * @type {string}
  */
-const serverURL = 'https://translate-service.scratch.mit.edu/';
+const server = 'tmt.tencentcloudapi.com';
+
+// eslint-disable-next-line no-unused-vars
+let secretId = 'xxxxsecretIdxxx';
+// eslint-disable-next-line no-unused-vars
+let secretKey = 'xxxxsecretKeyxxx';
 
 /**
  * How long to wait in ms before timing out requests to translate server.
@@ -110,6 +116,33 @@ class Scratch3TranslateBlocks {
             blockIconURI: blockIconURI,
             menuIconURI: menuIconURI,
             blocks: [
+                {
+                    opcode: 'setIdAndKey',
+                    text: formatMessage({
+                        id: 'translate.settingBlock',
+                        default: 'SECRET_ID [SECRET_ID] SECRET_KEY [SECRET_KEY]',
+                        description: 'setting custom SECRET_ID and SECRET_KEY'
+                    }),
+                    blockType: BlockType.COMMAND,
+                    arguments: {
+                        SECRET_ID: {
+                            type: ArgumentType.STRING,
+                            defaultValue: formatMessage({
+                                id: 'translate.defaultSecretId',
+                                default: 'xxxxsecretIdxxx',
+                                description: 'the default text to secretId'
+                            })
+                        },
+                        SECRET_KEY: {
+                            type: ArgumentType.STRING,
+                            defaultValue: formatMessage({
+                                id: 'translate.defaultSecretKey',
+                                default: 'xxxxsecretKeyxxx',
+                                description: 'the default text to secretKey'
+                            })
+                        }
+                    }
+                },
                 {
                     opcode: 'getTranslate',
                     text: formatMessage({
@@ -241,6 +274,44 @@ class Scratch3TranslateBlocks {
         return 'en';
     }
 
+    setIdAndKey (args) {
+        secretId = args.SECRET_ID;
+        secretKey = args.SECRET_KEY;
+    }
+
+    // 参数对转成字符串
+    paramsToStr (params) {
+        // 按参数名的字典序排序
+        params.sort((a, b) => {
+            if (a[0] < b[0]) return -1;
+            else if (a[0] > b[0]) return 1;
+            return 0;
+        });
+
+        // 连成字符串
+        const parPairStrArr = [];
+        for (const i in params) {
+            const par = params[i];
+            const parStr = par.join('=');
+            parPairStrArr.push(parStr);
+        }
+        const str = parPairStrArr.join('&');
+        return str;
+    }
+
+    // 声称签名
+    makeSignature (reqMethod, hostPath, reqParams) {
+        // 签名原文字符串
+        const paramsStr = this.paramsToStr(reqParams);
+        const signStr = `${reqMethod + server + hostPath}?${paramsStr}`;
+
+        // 签名
+        const hs = CryptoJS.HmacSHA1(signStr, secretKey);
+        const rawSig = CryptoJS.enc.Base64.stringify(hs);
+        const sig = encodeURIComponent(rawSig);
+        return sig;
+    }
+
     /**
      * Translates the text in the translate block to the language specified in the menu.
      * @param {object} args - the block arguments.
@@ -259,16 +330,41 @@ class Scratch3TranslateBlocks {
 
         const lang = this.getLanguageCodeFromArg(args.LANGUAGE);
 
-        let urlBase = `${serverURL}translate?language=`;
-        urlBase += lang;
-        urlBase += '&text=';
-        urlBase += encodeURIComponent(args.WORDS);
+        const reqMethod = 'GET';
+        const Nonce = Math.floor(Math.random() * 1000000000);
+        const date = new Date();
+        const timestamp = Math.floor(date.getTime() / 1000);
+
+        const reqParams = [
+            ['Action', 'TextTranslate'],
+            ['Nonce', Nonce],
+            ['ProjectId', 0],
+            ['Region', 'ap-beijing'],
+            ['SecretId', secretId],
+            ['Source', 'auto'],
+            ['SourceText', args.WORDS], // 生成签名时，使用原文本
+            ['Target', lang],
+            ['Timestamp', timestamp],
+            ['Version', '2018-03-21']
+        ];
+        log.warn(`yuanba WORDS is #### ${args.WORDS}`);
+
+        // 生成签名时，使用原文本
+        const sig = this.makeSignature(reqMethod, '/', reqParams);
+
+        // 原文本中所有的空格替换成+号，然后uri编码
+        const iSourceText = reqParams.findIndex(p => (p[0] === 'SourceText'));
+        // eslint-disable-next-line no-useless-escape
+        reqParams[iSourceText][1] = encodeURI(args.WORDS.replace(/\ /g, '+'));
+        const paramsStr = this.paramsToStr(reqParams);
+        const urlBase = `https://${server}/?${paramsStr}&Signature=${sig}`;
 
         const tempThis = this;
         const translatePromise = fetchWithTimeout(urlBase, {}, serverTimeoutMs)
             .then(response => response.text())
             .then(responseText => {
-                const translated = JSON.parse(responseText).result;
+                const translated = JSON.parse(responseText).Response.hasOwnProperty('TargetText') ?
+                    JSON.parse(responseText).Response.TargetText : '不支持该语种，请更换。';
                 tempThis._translateResult = translated;
                 // Cache what we just translated so we don't keep making the
                 // same call over and over.
